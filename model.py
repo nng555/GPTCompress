@@ -128,11 +128,12 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, meta_specials=None):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.meta_specials = meta_specials
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -178,7 +179,16 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, tok_emb=None, targets=None, return_state=False):
+    def forward(
+        self,
+        idx,
+        tok_emb=None,
+        targets=None,
+        attn_mask=None,
+        return_states=False,
+        return_logits=False
+    ):
+        stats = {}
 
         device = idx.device
         b, t = idx.size()
@@ -195,21 +205,26 @@ class GPT(nn.Module):
             x = tok_emb + pos_emb
 
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, attn_mask=attn_mask)
         x = self.transformer.ln_f(x)
-        if return_state:
+
+        if return_states:
             return x
+
+        if return_logits:
+            return self.lm_head(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            stats['ppl'] = 2 ** (float(loss) / math.log(2))
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, stats
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -298,7 +313,11 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+
+        #use_fused = fused_available and device_type == 'cuda'
+        # NOTE: disable fused to get float16 to work
+        use_fused = False
+
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
@@ -332,7 +351,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits = self(idx_cond, return_logits=True)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -354,11 +373,19 @@ class GPT(nn.Module):
 
 class GPTCompress(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, meta_specials):
+        assert meta_specials is not None, "Need special tokens for compression"
+        assert 'doc' in meta_specials, "Require special doc token"
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+
+        self.topk = config.topk
+        self.temperature = config.temperature
+
+        self.hard_loss_weight = config.hard_loss_weight
+        self.soft_loss_weight = config.soft_loss_weight
 
         # load pretrained lm
         ckpt_path = os.path.join(out_dir, 'ckpt_lm.pt')
@@ -373,11 +400,66 @@ class GPTCompress(nn.Module):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
         self.lm.load_state_dict(state_dict)
 
+        # set to eval and freeze parameters
+        self.lm.eval()
+        for param in self.lm.parameters():
+            param.requires_grad = False
+
         self.encoder = GPT(config)
 
         # report number of parameters
-        print("number of lm parameters: %.2fM" % self.lm.get_num_params()/1e6,)
-        print("number of encoder parameters: %.2fM" % self.encoder.get_num_params()/1e6,)
+        print("number of frozen lm parameters: %.2fM" % self.lm.get_num_params()/1e6,)
+        print("number of trainable encoder parameters: %.2fM" % self.encoder.get_num_params()/1e6,)
 
-    def forward(self, lm_idx, enc_idx, targets, attn_mask):
+    def forward(self, idx, lm_idx, enc_idx, targets, teacher_mask, attn_mask):
+
+        stats = {}
+
+        # get context embedding
+        # TODO: add linear layer to project through bottleneck
+        ctx_emb = self.encoder(enc_idx, attn_mask=attn_mask, return_states=True)
+        ctx_emb = ctx_emb[enc_idx == meta_specials['doc']]
+
+        tok_emb = self.lm.wte(lm_idx)
+        tok_emb[lm_idx == meta_specials['doc']] = ctx_emb
+
+        logits, hard_loss = self.lm(lm_idx, tok_emb=tok_emb, targets=targets)
+
+        if self.soft_loss_weight > 0:
+            # get soft labels
+            with torch.no_grad():
+                teacher_logits = self.lm(idx, return_logits=True)[teacher_mask]
+
+            # reduce to topk logits
+            if self.topk != -1:
+                topk_idxs = torch.topk(teacher_logits, self.topk, dim=-1, sorted=False).indices
+                topk_teacher_logits = torch.take(teacher_logits, topk_idxs)
+                topk_logits = torch.take(logits, topk_idxs)
+            else:
+                topk_teacher_logits = teacher_logits
+                topk_logits = logits
+
+            soft_loss = F.kl_div(
+                F.log_softmax(topk_logits / self.temperature, -1),
+                F.softmax(topk_teacher_logits / self.temperature, -1),
+                reduction='batchmean',
+            ) * self.temperature**2
+            loss = soft_loss * self.soft_loss_weight + hard_loss * self.hard_loss_weight
+
+            stats['soft_loss'] = float(soft_loss)
+            stats['hard_loss'] = float(hard_loss)
+            stats['cross_ppl'] = 2 ** (F.kl_div(
+                F.log_softmax(logits, -1),
+                F.softmax(teacher_logits, -1), reduction='batchmean') / math.log(2))
+
+        else:
+            loss = hard_loss
+
+        stats['ppl'] = 2 ** (hard_loss / math.log(2))
+
+        return logits, loss, stats
+
+
+
+
 

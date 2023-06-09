@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -28,9 +29,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, GPTCompress
+from data_utils import blockify, get_batch
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
+
 # I/O
 out_dir = 'out'
 eval_interval = 2000
@@ -39,16 +42,19 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+
 # data
 dataset = 'openwebtext'
 tasks = None
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+
 # model
 n_layer = 12
 n_head = 12
@@ -58,6 +64,11 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 model_type = "lm"
 causal = (model_type == "lm")
 ckpt_name = 'ckpt_lm.pt' if (model_type == "lm") else 'ckpt_enc.pt'
+topk = -1
+temperature = 1
+hard_loss_weight = 0.1
+soft_loss_weight = 1
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -65,13 +76,16 @@ weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
+
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
@@ -141,8 +155,10 @@ else:
     train_data = np.concatenate(train_data)
     val_data = np.concatenate(val_data)
 
-train_data = blockify(train_data)
-val_data = blockify(val_data)
+train_data = blockify(train_data, block_size, meta_specials, model_type=model_type)
+val_data = blockify(val_data, block_size, meta_specials, model_type=model_type)
+
+data = {'train': train_data, 'val': val_data}
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -162,7 +178,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = model_cls(gptconf)
+    model = model_cls(gptconf, meta_specials)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -225,17 +241,20 @@ if ddp:
 @torch.no_grad()
 def estimate_loss():
     out = {}
+    stat_accum = {'train': defaultdict(float), 'val': defaultdict(float)}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            batch = get_batch(split)
+            batch = get_batch(data[split], batch_size, device, device_type, model_type=model_type)
             with ctx:
-                logits, loss = model(**batch)
+                logits, loss, stats = model(**batch)
             losses[k] = loss.item()
+            for k, s in stats.items():
+                stat_accum[split][k] += s / eval_iters
         out[split] = losses.mean()
     model.train()
-    return out
+    return out, stat_accum
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -257,7 +276,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-batch = get_batch('train') # fetch the very first batch
+batch = get_batch(data['train'], batch_size, device, device_type, model_type=model_type) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -271,8 +290,16 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses, stats = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        train_str = 'train stats: '
+        for k, s in stats['train'].items():
+            train_str += f'{k} {s:.4f}, '
+        val_str = 'val stats: '
+        for k, s in stats['val'].items():
+            val_str += f'{k} {s:.4f}, '
+        print(train_str)
+        print(val_str)
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -297,6 +324,7 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    stat_accum = defaultdict(float)
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -307,10 +335,12 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(**batch)
+            logits, loss, stats = model(**batch)
+            for k, s in stats.items():
+                stat_accum[k] += s / gradient_accumulation_steps
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        batch = get_batch('train')
+        batch = get_batch(data['train'], batch_size, device, device_type, model_type=model_type)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -334,7 +364,10 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        logstr = f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+        for k, s in stat_accum.items():
+            logstr += f', {k} {s:.4f}'
+        print(logstr)
     iter_num += 1
     local_iter_num += 1
 
