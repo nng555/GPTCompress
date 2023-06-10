@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+import os
 import math
 import inspect
 from dataclasses import dataclass
@@ -66,6 +67,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1).repeat(1, self.n_head, 1, 1) # (B, nh, T, T)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -123,7 +126,12 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    topk: int = -1
+    temperature: int = 1
+    hard_loss_weight: float = 0
+    soft_loss_weight: float = 1
     dropout: float = 0.0
+    out_dir: str = None
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
@@ -380,6 +388,7 @@ class GPTCompress(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.meta_specials = meta_specials
 
         self.topk = config.topk
         self.temperature = config.temperature
@@ -388,11 +397,11 @@ class GPTCompress(nn.Module):
         self.soft_loss_weight = config.soft_loss_weight
 
         # load pretrained lm
-        ckpt_path = os.path.join(out_dir, 'ckpt_lm.pt')
+        ckpt_path = os.path.join(config.out_dir, 'ckpt_lm.pt')
         assert os.path.exists(ckpt_path), "No pretrained LM found"
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path)
         lmconf = GPTConfig(**checkpoint['model_args'])
-        self.lm = GPT(gptconf)
+        self.lm = GPT(lmconf)
         state_dict = checkpoint['model']
         unwanted_prefix = '_orig_mod.'
         for k,v in list(state_dict.items()):
@@ -408,8 +417,8 @@ class GPTCompress(nn.Module):
         self.encoder = GPT(config)
 
         # report number of parameters
-        print("number of frozen lm parameters: %.2fM" % self.lm.get_num_params()/1e6,)
-        print("number of trainable encoder parameters: %.2fM" % self.encoder.get_num_params()/1e6,)
+        print("number of frozen lm parameters: %.2fM" % (self.lm.get_num_params() / 1e6))
+        print("number of trainable encoder parameters: %.2fM" % (self.encoder.get_num_params() / 1e6))
 
     def forward(self, idx, lm_idx, enc_idx, targets, teacher_mask, attn_mask):
 
@@ -418,17 +427,22 @@ class GPTCompress(nn.Module):
         # get context embedding
         # TODO: add linear layer to project through bottleneck
         ctx_emb = self.encoder(enc_idx, attn_mask=attn_mask, return_states=True)
-        ctx_emb = ctx_emb[enc_idx == meta_specials['doc']]
+        ctx_emb = ctx_emb[enc_idx == self.meta_specials['doc']]
 
-        tok_emb = self.lm.wte(lm_idx)
-        tok_emb[lm_idx == meta_specials['doc']] = ctx_emb
+        tok_emb = self.lm.transformer.wte(lm_idx)
+        tok_emb[lm_idx == self.meta_specials['doc']] = ctx_emb
 
-        logits, hard_loss = self.lm(lm_idx, tok_emb=tok_emb, targets=targets)
+        logits, hard_loss, lm_stats = self.lm(lm_idx, tok_emb=tok_emb, targets=targets)
+
+        for k in lm_stats:
+            stats[k] = lm_stats[k]
 
         if self.soft_loss_weight > 0:
             # get soft labels
             with torch.no_grad():
-                teacher_logits = self.lm(idx, return_logits=True)[teacher_mask]
+                teacher_logits = self.lm(idx, return_logits=True)[teacher_mask.bool()]
+
+            logits = logits[(targets != -1) & (targets != self.meta_specials['eos'])]
 
             # reduce to topk logits
             if self.topk != -1:
@@ -455,11 +469,41 @@ class GPTCompress(nn.Module):
         else:
             loss = hard_loss
 
-        stats['ppl'] = 2 ** (hard_loss / math.log(2))
-
         return logits, loss, stats
 
+    # TODO: should we inherit this?
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
 
+        #use_fused = fused_available and device_type == 'cuda'
+        # NOTE: disable fused to get float16 to work
+        use_fused = False
+
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+    def estimate_mfu(self, *args):
+        return self.lm.estimate_mfu(*args) + self.encoder.estimate_mfu(*args)
 
 
 

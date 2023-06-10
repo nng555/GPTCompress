@@ -166,7 +166,9 @@ best_val_loss = 1e9
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, topk=topk, out_dir=out_dir,
+                  temperature=temperature, hard_loss_weight=hard_loss_weight,
+                  soft_loss_weight=soft_loss_weight) # start with model_args from command line
 
 model_cls = GPT if model_type == 'lm' else GPTCompress
 

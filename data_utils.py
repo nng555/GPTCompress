@@ -50,7 +50,8 @@ def blockify_lm(data, block_size, meta_specials):
     print(f"min block size: {min_block_size}/{block_size}")
     return np.array(blocks, dtype=np.int16), np.array(labels, dtype=np.int16)
 
-def blockify_enc(data):
+def blockify_enc(data, block_size, meta_specials):
+    min_block_size = block_size
 
     blocks = []
     label_masks = []
@@ -62,20 +63,15 @@ def blockify_enc(data):
     eos_id = meta_specials['eos']
     doc_id = meta_specials['doc']
 
-    # grab contexts for encoder and replace with doc
-    # [EOS] [------] | ---- > -------
-    # [EOS] D | ---- > -------
-    prompt_idxs = np.where(block == meta_specials['prompt'])[0]
-    eos_idxs = np.where(block == eos_id)[0][1:] # skip first EOS
-
+    s_idx = 0
     while s_idx < len(data) - 1:
 
         # grab block while respecting example boundaries
-        e_idx = min(s_idx + block_size, len(data) - 1)
+        e_idx = min(s_idx + block_size - 1, len(data) - 1)
         while data[e_idx] != eos_id:
             e_idx -= 1
         block = data[s_idx:e_idx + 1]
-        full_blocks.append(pad_to_max(block, eos_id, block_size))
+        blocks.append(pad_to_max(block, eos_id, block_size))
 
         if len(block) < min_block_size:
             min_block_size = len(block)
@@ -85,38 +81,44 @@ def blockify_enc(data):
         eos_idxs = np.where(block == eos_id)[0][1:] # skip start EOS
         start_eidx = 0
 
+        # grab contexts for encoder and replace with doc
+        # block: [EOS] ------ | ---- > -------
+        # lm:    [EOS] D | ---- > -------
+        # enc:   [EOS] D --------
         label_mask = np.zeros(block_size)
         extra_blocks = defaultdict(list)
         for pidx, aidx, eidx in zip(prompt_idxs, ans_idxs, eos_idxs):
-            label_mask[aidx:eidx] = True
+            label_mask[aidx + 1:eidx] = True
             extra_blocks['lm_block'].append(
-                np.concatenate(
+                np.concatenate((
                     np.array([eos_id, doc_id]),
                     block[pidx:eidx],
-                )
+                ))
             )
             extra_blocks['lm_label'].append(
-                np.concatenate(
+                np.concatenate((
                     np.ones(2 + (aidx - pidx)) * -1,
-                    block[aidx:eidx],
-                )
+                    block[aidx + 1:eidx + 1],
+                ))
             )
             extra_blocks['enc_block'].append(
-                np.concatenate(
+                np.concatenate((
                     np.array([eos_id, doc_id]),
-                    block[start_eidx + 1:p_idx],
-                )
+                    block[start_eidx + 1:pidx],
+                ))
             )
-            extra_blocks['enc_len'].append(p_idx - start_eidx)
+            extra_blocks['enc_len'].append(pidx - start_eidx)
             start_eidx = eidx
 
         label_masks.append(label_mask)
         lm_blocks.append(pad_to_max(np.concatenate(extra_blocks['lm_block']), eos_id, block_size))
-        lm_labels.append(pad_to_max(np.concatenate(extra_blocks['lm_label'])[1:], eos_id, block_size))
+        lm_labels.append(pad_to_max(np.concatenate(extra_blocks['lm_label']), -1, block_size))
         enc_blocks.append(pad_to_max(np.concatenate(extra_blocks['enc_block']), eos_id, block_size))
         enc_lens.append(extra_blocks['enc_len'])
+        s_idx = e_idx
 
-    return np.array(full_blocks, dtype=np.int16), \
+    print(f"min block size: {min_block_size}/{block_size}")
+    return np.array(blocks, dtype=np.int16), \
            np.array(label_masks, dtype=np.int16), \
            np.array(lm_blocks, dtype=np.int16), \
            np.array(lm_labels, dtype=np.int16), \
@@ -134,7 +136,7 @@ def make_attn_mask(seq_lens, block_size):
     assert total_len < block_size, "total length must be less than block size"
     blocks = [torch.ones((slen, slen)) for slen in seq_lens]
     if total_len < block_size:
-        blocks.append(torch.ones((block_size - total_len, block_size - total_len)))
+        blocks.append(torch.zeros((block_size - total_len, block_size - total_len)))
     attn_mask = torch.block_diag(*blocks)
     return attn_mask
 
@@ -143,7 +145,7 @@ def send_to_device(device, device_type, *args):
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         return [a.pin_memory().to(device, non_blocking=True) for a in args]
     else:
-        return [a.pinmemory().to(device) for a in args]
+        return [a.pin_memory().to(device) for a in args]
 
 # get random batch of blocks from dataset
 def get_batch(data, batch_size, device, device_type, model_type="lm"):
@@ -173,11 +175,12 @@ def get_batch(data, batch_size, device, device_type, model_type="lm"):
         lm_x = torch.from_numpy(lm_xs[ix].astype(np.int64))
         lm_y = torch.from_numpy(lm_ys[ix].astype(np.int64))
         enc_x = torch.from_numpy(enc_xs[ix].astype(np.int64))
+        enc_ls = [enc_lens[i] for i in ix]
 
         block_size = lm_x.shape[-1]
-        enc_masks = torch.stack([make_attn_mask(lens, block_size) for lens in enc_lens])
+        enc_masks = torch.stack([make_attn_mask(lens, block_size) for lens in enc_ls])
 
-        lm_x, lm_y, enc_x, enc_masks = send_to_device(device, device_type, lm_x, lm_y, enc_x, enc_masks)
+        x, y_mask, lm_x, lm_y, enc_x, enc_masks = send_to_device(device, device_type, x, y_mask, lm_x, lm_y, enc_x, enc_masks)
 
         return {
             'idx': x,
