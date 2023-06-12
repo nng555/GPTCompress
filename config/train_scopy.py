@@ -1,6 +1,6 @@
 # train on toy sequence dataset
 
-out_dir = 'out-sequence'
+out_dir = 'out-scopy'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -13,7 +13,7 @@ wandb_project = 'shakespeare-char'
 wandb_run_name = 'mini-gpt'
 
 dataset = 'sequence'
-tasks = ['odd']
+tasks = ['scopy']
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters

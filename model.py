@@ -130,6 +130,7 @@ class GPTConfig:
     temperature: int = 1
     hard_loss_weight: float = 0
     soft_loss_weight: float = 1
+    kernel_size: int = -1
     dropout: float = 0.0
     out_dir: str = None
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -379,6 +380,10 @@ class GPT(nn.Module):
 
         return idx
 
+class Transpose(nn.Module):
+    def forward(self, x):
+        return torch.transpose(x, 1, 2)
+
 class GPTCompress(nn.Module):
 
     def __init__(self, config, meta_specials):
@@ -392,6 +397,8 @@ class GPTCompress(nn.Module):
 
         self.topk = config.topk
         self.temperature = config.temperature
+
+        self.kernel_size = config.kernel_size
 
         self.hard_loss_weight = config.hard_loss_weight
         self.soft_loss_weight = config.soft_loss_weight
@@ -414,7 +421,19 @@ class GPTCompress(nn.Module):
         for param in self.lm.parameters():
             param.requires_grad = False
 
+        # TODO: always load in half?
+        self.lm = self.lm.half()
+
         self.encoder = GPT(config)
+
+        if self.kernel_size != -1:
+            self.embed_encoder = nn.Sequential(
+                Transpose(),
+                nn.Conv1d(config.n_embd, config.n_embd, self.kernel_size, stride=self.kernel_size),
+                Transpose(),
+                nn.ReLU(),
+                nn.Linear(config.n_embd, config.n_embd)
+            )
 
         # report number of parameters
         print("number of frozen lm parameters: %.2fM" % (self.lm.get_num_params() / 1e6))
@@ -427,10 +446,18 @@ class GPTCompress(nn.Module):
         # get context embedding
         # TODO: add linear layer to project through bottleneck
         ctx_emb = self.encoder(enc_idx, attn_mask=attn_mask, return_states=True)
-        ctx_emb = ctx_emb[enc_idx == self.meta_specials['doc']]
+        if self.kernel_size != -1:
+            ctx_emb = self.embed_encoder(ctx_emb)
+            ctx_mask = torch.zeros(ctx_emb.shape[:-1]).bool()
+            doc_mask = lm_idx == self.meta_specials['doc']
+            for i, nids in enumerate(doc_mask.sum(-1)):
+                ctx_mask[i][:nids] = True
+            ctx_emb = ctx_emb[ctx_mask]
+        else:
+            ctx_emb =  ctx_emb[enc_idx == self.meta_specials['doc']]
 
         tok_emb = self.lm.transformer.wte(lm_idx)
-        tok_emb[lm_idx == self.meta_specials['doc']] = ctx_emb
+        tok_emb[lm_idx == self.meta_specials['doc']] = ctx_emb.half()
 
         logits, hard_loss, lm_stats = self.lm(lm_idx, tok_emb=tok_emb, targets=targets)
 
@@ -505,5 +532,30 @@ class GPTCompress(nn.Module):
     def estimate_mfu(self, *args):
         return self.lm.estimate_mfu(*args) + self.encoder.estimate_mfu(*args)
 
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_id=None):
+
+
+        for _ in (ens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits = self(idx_cond, return_logits=True)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            if eos_id is not None:
+                if idx_next == eos_id:
+                    break
 
 

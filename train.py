@@ -59,15 +59,15 @@ block_size = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
+kernel_size = -1
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 model_type = "lm"
-causal = (model_type == "lm")
-ckpt_name = 'ckpt_lm.pt' if (model_type == "lm") else 'ckpt_enc.pt'
+ckpt_name = f'ckpt_{model_type}.pt'
 topk = -1
 temperature = 1
-hard_loss_weight = 0.1
-soft_loss_weight = 1
+hard_loss_weight = 1
+soft_loss_weight = 0
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -155,8 +155,8 @@ else:
     train_data = np.concatenate(train_data)
     val_data = np.concatenate(val_data)
 
-train_data = blockify(train_data, block_size, meta_specials, model_type=model_type)
-val_data = blockify(val_data, block_size, meta_specials, model_type=model_type)
+train_data = blockify(train_data, block_size, meta_specials, model_type=model_type, kernel_size=kernel_size)
+val_data = blockify(val_data, block_size, meta_specials, model_type=model_type, kernel_size=kernel_size)
 
 data = {'train': train_data, 'val': val_data}
 
@@ -168,7 +168,7 @@ best_val_loss = 1e9
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, topk=topk, out_dir=out_dir,
                   temperature=temperature, hard_loss_weight=hard_loss_weight,
-                  soft_loss_weight=soft_loss_weight) # start with model_args from command line
+                  soft_loss_weight=soft_loss_weight, kernel_size=kernel_size) # start with model_args from command line
 
 model_cls = GPT if model_type == 'lm' else GPTCompress
 
