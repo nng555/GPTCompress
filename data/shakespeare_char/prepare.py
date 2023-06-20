@@ -18,13 +18,24 @@ if not os.path.exists(input_file_path):
 
 with open(input_file_path, 'r') as f:
     data = f.read()
+data = '\n' + data + '\n'
 print(f"length of dataset in characters: {len(data):,}")
 
 # get all the unique characters that occur in this text
 chars = sorted(list(set(data)))
+
+# add DOC char
+chars.append('@')
+chars.append('^')
 vocab_size = len(chars)
 print("all the unique characters:", ''.join(chars))
 print(f"vocab size: {vocab_size:,}")
+
+SPECIAL_MAP = {
+    'eos': '\n',
+    'doc': '@',
+    'pad': '^',
+}
 
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
@@ -36,8 +47,12 @@ def decode(l):
 
 # create the train and test splits
 n = len(data)
-train_data = data[:int(n*0.9)]
-val_data = data[int(n*0.9):]
+cutoff = int(n * 0.9)
+while data[cutoff] != '\n':
+    cutoff -= 1
+
+train_data = data[:cutoff + 1]
+val_data = data[cutoff:]
 
 # encode both to integers
 train_ids = encode(train_data)
@@ -56,6 +71,7 @@ meta = {
     'vocab_size': vocab_size,
     'itos': itos,
     'stoi': stoi,
+    'specials': SPECIAL_MAP,
 }
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)

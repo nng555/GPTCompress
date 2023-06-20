@@ -7,117 +7,14 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import os
 import math
 import inspect
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
-def new_gelu(x):
-    """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
-    """
-    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
-
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
-
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x, attn_mask=None):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(1).repeat(1, self.n_head, 1, 1) # (B, nh, T, T)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            # default to causal if attn_mask not provided
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=attn_mask is None)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            if attn_mask is None:
-                attn_mask = self.bias[:,:,:T,:T]
-            att = att.masked_fill(attn_mask == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = new_gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x, attn_mask=None):
-        x = x + self.attn(self.ln_1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.ln_2(x))
-        return x
+from dataclasses import dataclass
+from modules import TransformerBlock, LayerNorm
 
 @dataclass
 class GPTConfig:
@@ -130,7 +27,9 @@ class GPTConfig:
     temperature: int = 1
     hard_loss_weight: float = 0
     soft_loss_weight: float = 1
-    kernel_size: int = -1
+    gate_weight: float = 1
+    kernel_size: int = 0
+    ntokens: int = 0
     dropout: float = 0.0
     out_dir: str = None
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -148,7 +47,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -195,8 +94,10 @@ class GPT(nn.Module):
         targets=None,
         attn_mask=None,
         return_states=False,
-        return_logits=False
+        return_logits=False,
+        causal=True,
     ):
+        assert not (causal and attn_mask is not None), "cannot set attn mask with causal attn"
         stats = {}
 
         device = idx.device
@@ -214,7 +115,7 @@ class GPT(nn.Module):
             x = tok_emb + pos_emb
 
         for block in self.transformer.h:
-            x = block(x, attn_mask=attn_mask)
+            x = block(x, attn_mask=attn_mask, causal=causal)
         x = self.transformer.ln_f(x)
 
         if return_states:
@@ -379,183 +280,3 @@ class GPT(nn.Module):
                     break
 
         return idx
-
-class Transpose(nn.Module):
-    def forward(self, x):
-        return torch.transpose(x, 1, 2)
-
-class GPTCompress(nn.Module):
-
-    def __init__(self, config, meta_specials):
-        assert meta_specials is not None, "Need special tokens for compression"
-        assert 'doc' in meta_specials, "Require special doc token"
-        super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-        self.config = config
-        self.meta_specials = meta_specials
-
-        self.topk = config.topk
-        self.temperature = config.temperature
-
-        self.kernel_size = config.kernel_size
-
-        self.hard_loss_weight = config.hard_loss_weight
-        self.soft_loss_weight = config.soft_loss_weight
-
-        # load pretrained lm
-        ckpt_path = os.path.join(config.out_dir, 'ckpt_lm.pt')
-        assert os.path.exists(ckpt_path), "No pretrained LM found"
-        checkpoint = torch.load(ckpt_path)
-        lmconf = GPTConfig(**checkpoint['model_args'])
-        self.lm = GPT(lmconf)
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        for k,v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        self.lm.load_state_dict(state_dict)
-
-        # set to eval and freeze parameters
-        self.lm.eval()
-        for param in self.lm.parameters():
-            param.requires_grad = False
-
-        # TODO: always load in half?
-        self.lm = self.lm.half()
-
-        self.encoder = GPT(config)
-
-        if self.kernel_size != -1:
-            self.embed_encoder = nn.Sequential(
-                Transpose(),
-                nn.Conv1d(config.n_embd, config.n_embd, self.kernel_size, stride=self.kernel_size),
-                Transpose(),
-                nn.ReLU(),
-                nn.Linear(config.n_embd, config.n_embd)
-            )
-
-        # report number of parameters
-        print("number of frozen lm parameters: %.2fM" % (self.lm.get_num_params() / 1e6))
-        print("number of trainable encoder parameters: %.2fM" % (self.encoder.get_num_params() / 1e6))
-
-    def forward(self, idx, lm_idx, enc_idx, targets, teacher_mask, attn_mask):
-
-        stats = {}
-
-        # get context embedding
-        # TODO: add linear layer to project through bottleneck
-        ctx_emb = self.encoder(enc_idx, attn_mask=attn_mask, return_states=True)
-        if self.kernel_size != -1:
-            ctx_emb = self.embed_encoder(ctx_emb)
-            ctx_mask = torch.zeros(ctx_emb.shape[:-1]).bool()
-            doc_mask = lm_idx == self.meta_specials['doc']
-            for i, nids in enumerate(doc_mask.sum(-1)):
-                ctx_mask[i][:nids] = True
-            ctx_emb = ctx_emb[ctx_mask]
-        else:
-            ctx_emb =  ctx_emb[enc_idx == self.meta_specials['doc']]
-
-        tok_emb = self.lm.transformer.wte(lm_idx)
-        tok_emb[lm_idx == self.meta_specials['doc']] = ctx_emb.half()
-
-        logits, hard_loss, lm_stats = self.lm(lm_idx, tok_emb=tok_emb, targets=targets)
-
-        for k in lm_stats:
-            stats[k] = lm_stats[k]
-
-        if self.soft_loss_weight > 0:
-            # get soft labels
-            with torch.no_grad():
-                teacher_logits = self.lm(idx, return_logits=True)[teacher_mask.bool()]
-
-            logits = logits[(targets != -1) & (targets != self.meta_specials['eos'])]
-
-            # reduce to topk logits
-            if self.topk != -1:
-                topk_idxs = torch.topk(teacher_logits, self.topk, dim=-1, sorted=False).indices
-                topk_teacher_logits = torch.take(teacher_logits, topk_idxs)
-                topk_logits = torch.take(logits, topk_idxs)
-            else:
-                topk_teacher_logits = teacher_logits
-                topk_logits = logits
-
-            soft_loss = F.kl_div(
-                F.log_softmax(topk_logits / self.temperature, -1),
-                F.softmax(topk_teacher_logits / self.temperature, -1),
-                reduction='batchmean',
-            ) * self.temperature**2
-            loss = soft_loss * self.soft_loss_weight + hard_loss * self.hard_loss_weight
-
-            stats['soft_loss'] = float(soft_loss)
-            stats['hard_loss'] = float(hard_loss)
-            stats['cross_ppl'] = 2 ** (F.kl_div(
-                F.log_softmax(logits, -1),
-                F.softmax(teacher_logits, -1), reduction='batchmean') / math.log(2))
-
-        else:
-            loss = hard_loss
-
-        return logits, loss, stats
-
-    # TODO: should we inherit this?
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-
-        #use_fused = fused_available and device_type == 'cuda'
-        # NOTE: disable fused to get float16 to work
-        use_fused = False
-
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    def estimate_mfu(self, *args):
-        return self.lm.estimate_mfu(*args) + self.encoder.estimate_mfu(*args)
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eos_id=None):
-
-
-        for _ in (ens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits = self(idx_cond, return_logits=True)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-            if eos_id is not None:
-                if idx_next == eos_id:
-                    break
-
-

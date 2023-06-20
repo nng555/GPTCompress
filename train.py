@@ -28,8 +28,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT, GPTCompress
-from data_utils import blockify, get_batch
+from models import GPTConfig, GPT, GPTCompress
+from data_utils import blockify, get_batch, preprocess
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -50,7 +50,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 
 # data
 dataset = 'openwebtext'
-tasks = None
+task = ''
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -59,15 +59,18 @@ block_size = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
-kernel_size = -1
+kernel_size = 0
+c_block_size = 50
+ntokens = 1
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 model_type = "lm"
-ckpt_name = f'ckpt_{model_type}.pt'
+ckpt_name = 'ckpt'
 topk = -1
 temperature = 1
-hard_loss_weight = 1
-soft_loss_weight = 0
+hard_loss_weight = 1.0
+soft_loss_weight = 0.0
+gate_weight = 1
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -129,34 +132,45 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # attempt to derive vocab_size from the dataset
 data_dir = os.path.join('data', dataset)
+if task != '':
+    data_dir = os.path.join(data_dir, task)
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
 meta_specials = None
+meta_ntrain = None
+meta_nval = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     meta_specials = {k: meta['stoi'][v] for k, v in meta['specials'].items()}
+    """
+    if kernel_size == 0 and ntokens > 1:
+        for i in range(1, ntokens):
+            meta_specials[f'doc{i}'] = meta_vocab_size + i - 1
+        print(f"added an additional {ntokens - 1} doc tokens to vocab")
+        meta_vocab_size += ntokens - 1
+    """
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    if 'ntrain' in meta:
+        meta_ntrain = meta['ntrain']
+    if 'nval' in meta:
+        meta_nval = meta['nval']
 
 # poor man's data loader
-if tasks is None:
-    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.int16, mode='r')
-    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.int16, mode='r')
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.int16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.int16, mode='r')
+
+if meta_ntrain is not None and meta_nval is not None:
+    train_data = np.reshape(train_data, (meta_ntrain, -1))
+    val_data = np.reshape(val_data, (meta_nval, -1))
+
+if train_data.ndim == 1:
+    train_data = blockify(train_data, block_size, meta_specials, model_type=model_type, c_block_size=c_block_size, ntokens=ntokens)
+    val_data = blockify(val_data, block_size, meta_specials, model_type=model_type, c_block_size=c_block_size, ntokens=ntokens)
 else:
-    train_data = []
-    val_data = []
-    for task in tasks:
-        task_dir = os.path.join(data_dir, task)
-        train_data.append(np.memmap(os.path.join(task_dir, 'train.bin'), dtype=np.int16, mode='r'))
-        val_data.append(np.memmap(os.path.join(task_dir, 'val.bin'), dtype=np.int16, mode='r'))
-
-    # TODO:can't shuffle tasks together because of memmap
-    train_data = np.concatenate(train_data)
-    val_data = np.concatenate(val_data)
-
-train_data = blockify(train_data, block_size, meta_specials, model_type=model_type, kernel_size=kernel_size)
-val_data = blockify(val_data, block_size, meta_specials, model_type=model_type, kernel_size=kernel_size)
+    train_data = preprocess(train_data, meta_specials, model_type=model_type, kernel_size=kernel_size, ntokens=ntokens)
+    val_data = preprocess(val_data, meta_specials, model_type=model_type, kernel_size=kernel_size, ntokens=ntokens)
 
 data = {'train': train_data, 'val': val_data}
 
@@ -168,7 +182,8 @@ best_val_loss = 1e9
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, topk=topk, out_dir=out_dir,
                   temperature=temperature, hard_loss_weight=hard_loss_weight,
-                  soft_loss_weight=soft_loss_weight, kernel_size=kernel_size) # start with model_args from command line
+                  soft_loss_weight=soft_loss_weight, gate_weight=gate_weight,
+                  kernel_size=kernel_size, ntokens=ntokens) # start with model_args from command line
 
 model_cls = GPT if model_type == 'lm' else GPTCompress
 
@@ -184,7 +199,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, ckpt_name)
+    ckpt_path = os.path.join(out_dir, ckpt_name + '_' + model_type + '.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -282,7 +297,7 @@ batch = get_batch(data['train'], batch_size, device, device_type, model_type=mod
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
+#running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
@@ -308,7 +323,7 @@ while True:
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                #"mfu": running_mfu*100, # convert to percentage
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -322,7 +337,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, ckpt_name))
+                torch.save(checkpoint, os.path.join(out_dir, ckpt_name + '_' + model_type + '.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -363,10 +378,13 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        """
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         logstr = f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+        """
+        logstr = f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms"
         for k, s in stat_accum.items():
             logstr += f', {k} {s:.4f}'
         print(logstr)

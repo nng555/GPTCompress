@@ -16,13 +16,16 @@ SPECIAL_MAP = {
 }
 VOCAB = TOKENS + list(SPECIAL_MAP.values())
 OTOS = {
-    'copy': '0',
-    'scopy': '1',
-    'sum_mod': '2',
-    'add': '3',
+    'copy': ['0', 'gen_random'],
+    'scopy': ['1', 'gen_random'],
+    'sum_mod': ['2', 'gen_random'],
+    'add': ['3', 'gen_num'],
 }
 STOI = {c: i for i, c in enumerate(VOCAB)}
 ITOS = {i: c for i, c in enumerate(VOCAB)}
+
+def pad_to_max(arr, pad_id, max_len):
+    return np.pad(arr, (0, max_len - len(arr)), 'constant', constant_values=pad_id)
 
 def encode(s_list):
     if isinstance(s_list, str):
@@ -36,41 +39,54 @@ def decode(i_list):
     else:
         return [decode(i) for i in i_list]
 
-def add(s1, s2):
-    s1 = int(''.join(s1))
-    s2 = int(''.join(s2))
-    return [int(v) for v in str(s1 + s2)], '2'
+def ltoi(l):
+    return int(ltos(l))
 
-def sum_mod(s, n=None, mod=None):
-    if n is None:
-        n = np.random.randint(2, 10)
-    if mod is None:
-        mod = np.random.randint(2, 11)
+def ltos(l):
+    return ''.join([str(v) for v in l])
 
-    ans = []
-    i = 0
-    while(i < len(s)):
-        ans.append(np.sum(s[i:i+n]) % mod)
-        i += n
-    if mod == 10:
-        mod = 0
-    return ans, f'{n}{mod}'
+def gen_random():
+    raise NotImplementedError
 
-def copy(s):
-    return s, None
+def gen_num():
+    seq_len = 10
+    start = np.random.choice(np.arange(1, 10))
+    seq = np.random.choice(np.arange(10), size=seq_len-1)
+    seq = np.insert(seq, 0, start)
+    return seq
 
-def scopy(s, stride=None, offset=None):
+
+def add(seq_fn):
+    s1 = seq_fn()
+    s2 = seq_fn()
+
+    s1 = ltos(s1)
+    s2 = ltos(s2)
+    ans = int(s1) + int(s2)
+    return s1 + ',' + s2, str(ans), None
+
+def copy(seq_fn):
+    s = ''.join([str(v) for v in seq_fn()])
+    return s, s, None
+
+def scopy(seq_fn, stride=None, offset=None):
+    s = seq_fn()
     if stride is None:
         stride = np.random.randint(2, 10)
     if offset is None:
         offset = np.random.randint(10)
-    return s[offset::stride], f'{stride}{offset}'
+    s = ''.join([str(v) for v in s])
+    ans = ''.join([str(v) for v in s[offset::stride]])
+    return s, ans, f'{stride}{offset}'
+
 
 def generate(nexamples, op, **kwargs):
 
     assert op in OTOS, f"Operation {op} not supported"
     assert op in globals(), f"Operation {op} not defined"
     op_fn = globals()[op]
+    op_name, seq_fn = OTOS[op]
+    seq_fn = globals()[seq_fn]
 
     task_name = op
     for k, v in kwargs.items():
@@ -78,30 +94,29 @@ def generate(nexamples, op, **kwargs):
     data_dir = os.path.join(os.path.dirname(__file__), task_name)
     pathlib.Path(data_dir).mkdir(parents=True, exist_ok=True)
 
+    """
+    # markov chain generation
     x = np.arange(-5, 5)
     xU, xL = x + 0.5, x - 0.5
     prob = ss.norm.cdf(xU, scale=1.5) - ss.norm.cdf(xL, scale=1.5)
     prob = prob / prob.sum()
+    """
 
     # generate raw data
     data = []
     for i in range(nexamples):
 
         # TODO: set this from command line
-        seq_len = np.random.randint(5, 30)
-        start = np.random.choice(TOKENS)
-        seq = np.random.choice(x, size=seq_len-1, p=prob)
-        seq = np.insert(seq, 0, start)
-        seq = np.cumsum(seq) % 10
+        #seq_len = np.random.randint(5, 30)
+        #start = np.random.choice(TOKENS)
+        #seq = np.random.choice(x, size=seq_len-1, p=prob)
+        #seq = np.insert(seq, 0, start)
+        #seq = np.cumsum(seq) % 10
+        seq, ans, suf = op_fn(seq_fn, **kwargs)
+        prompt = op_name + ('' if suf is None else suf)
 
-        ans, suf = op_fn(seq, **kwargs)
-        ans = ''.join([str(v) for v in ans])
-        seq = ''.join([str(v) for v in seq])
-
-        op_name = OTOS[op] + ('' if suf is None else suf)
-
-        example = ''.join(seq) + SPECIAL_MAP['prompt'] + op_name + \
-            SPECIAL_MAP['answer'] + ''.join(ans) + SPECIAL_MAP['eos']
+        example = SPECIAL_MAP['eos'] + seq + SPECIAL_MAP['prompt'] + prompt + \
+            SPECIAL_MAP['answer'] + ans + SPECIAL_MAP['eos']
         data.append(example)
 
     # write raw data
@@ -117,6 +132,17 @@ def generate(nexamples, op, **kwargs):
     train_ids = encode(train_data)
     val_ids = encode(val_data)
 
+    # stack examples
+    max_train_len = max([len(ids) for ids in train_ids])
+    max_val_len = max([len(ids) for ids in val_ids])
+
+    train_ids = np.stack([pad_to_max(ids, STOI[SPECIAL_MAP['eos']], max_train_len) for ids in train_ids])
+    val_ids = np.stack([pad_to_max(ids, STOI[SPECIAL_MAP['eos']], max_val_len) for ids in val_ids])
+
+    train_ids = train_ids.astype(np.int16)
+    val_ids = val_ids.astype(np.int16)
+
+    """
     # add initial eos token
     train_ids[0] = [STOI[SPECIAL_MAP['eos']]] + train_ids[0]
     val_ids[0] = [STOI[SPECIAL_MAP['eos']]] + val_ids[0]
@@ -124,6 +150,8 @@ def generate(nexamples, op, **kwargs):
     # flatten and export to bin
     train_ids = np.array([l for sublist in train_ids for l in sublist], dtype=np.int16)
     val_ids = np.array([l for sublist in val_ids for l in sublist], dtype=np.int16)
+    """
+
     train_ids.tofile(os.path.join(data_dir, 'train.bin'))
     val_ids.tofile(os.path.join(data_dir, 'val.bin'))
 
@@ -133,6 +161,8 @@ def generate(nexamples, op, **kwargs):
         'itos': ITOS,
         'stoi': STOI,
         'specials': SPECIAL_MAP,
+        'ntrain': len(train_ids),
+        'nval': len(val_ids),
     }
     with open(os.path.join(data_dir, 'meta.pkl'), 'wb') as f:
         pickle.dump(meta, f)
