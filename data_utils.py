@@ -75,10 +75,10 @@ def preprocess_gumbel(data, meta_specials):
 
     return full_idx, teacher_masks, lm_idxs, full_labels, enc_idxs,
 
-def preprocess_enc(data, meta_specials, kernel_size=0, ntokens=0):
-    assert not (kernel_size == 0 and ntokens == 0), "must set one of kernel_size or ntokens"
+def preprocess_enc(data, meta_specials):
     eos_id = meta_specials['eos']
     doc_id = meta_specials['doc']
+    pad_id = meta_specials['pad']
 
     full_idx = data
     full_labels = full_idx[:, 1:]
@@ -100,13 +100,6 @@ def preprocess_enc(data, meta_specials, kernel_size=0, ntokens=0):
     enc_idxs = pad_to_max(enc_idxs, eos_id)
     lm_idxs = pad_to_max(lm_idxs, eos_id)
     lm_labels = pad_to_max(lm_labels, -1)
-
-    # if static compression length, pregenerate single or multiple doc idxs
-    if kernel_size == 0:
-        if 'doc1' not in meta_specials:
-            doc_idxs = np.array([doc_id] * ntokens)
-        else:
-            doc_idxs = np.array([doc_id] + [meta_specials[f'doc{i}'] for i in range(1, ntokens)])
 
     doc_idxs = np.repeat(doc_idxs[None, :], len(full_idx), axis=0)
     enc_idxs = np.concatenate((doc_idxs, enc_idxs), axis=-1)
@@ -198,24 +191,27 @@ def blockify_fixed_enc(data, block_size, meta_specials, c_block_size=50, ntokens
         block = data[s_idx:e_idx + 1] # include EOS at end of block
         block = pad_to_max(block, pad_id, 1 + block_size)
 
-        enc_block = block[:c_block_size]
-        lm_block = np.concatenate((np.array([doc_id] * ntokens), block[c_block_size:]))
         teacher_mask = np.zeros_like(block)
         teacher_mask[c_block_size:] = 1
         teacher_mask[block == pad_id] = 0
 
-        lm_label = np.concatenate((np.ones(ntokens) * -1, block[c_block_size:]))
+        enc_block = block[:c_block_size]
+        lm_block = np.copy(block)
+        lm_block[:c_block_size] = doc_id
+
+        lm_label = np.copy(lm_block)
+        lm_label[:c_block_size] = -1
         lm_label[lm_label == pad_id] = -1
 
         if len(block) < min_block_size:
             min_block_size = len(block)
 
         # offset labels and inputs
-        lm_labels.append(lm_label[1:])
         blocks.append(block[:-1])
+        teacher_masks.append(teacher_mask[:-1])
         enc_blocks.append(enc_block)
         lm_blocks.append(lm_block[:-1])
-        teacher_masks.append(teacher_mask[:-1])
+        lm_labels.append(lm_label[1:])
 
         # update start index, should always be EOS
         s_idx = e_idx

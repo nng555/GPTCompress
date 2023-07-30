@@ -70,7 +70,7 @@ topk = -1
 temperature = 1
 hard_loss_weight = 1.0
 soft_loss_weight = 0.0
-gate_weight = 1
+encoder_loss_weight = 1.0
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -182,7 +182,7 @@ best_val_loss = 1e9
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout, topk=topk, out_dir=out_dir,
                   temperature=temperature, hard_loss_weight=hard_loss_weight,
-                  soft_loss_weight=soft_loss_weight, gate_weight=gate_weight,
+                  soft_loss_weight=soft_loss_weight, encoder_loss_weight=encoder_loss_weight,
                   kernel_size=kernel_size, ntokens=ntokens) # start with model_args from command line
 
 model_cls = GPT if model_type == 'lm' else GPTCompress

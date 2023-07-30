@@ -12,9 +12,10 @@ SPECIAL_MAP = {
     'answer': '>',
     'sep': ',',
     'eos': '\n',
-    'doc': 'D'
+    'doc': 'D',
+    'pad': '\n'
 }
-VOCAB = TOKENS + list(SPECIAL_MAP.values())
+VOCAB = TOKENS + list(set(SPECIAL_MAP.values()))
 OTOS = {
     'copy': ['0', 'gen_random'],
     'scopy': ['1', 'gen_random'],
